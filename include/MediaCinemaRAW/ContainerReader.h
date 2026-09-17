@@ -1,9 +1,9 @@
 #pragma once
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Clean-room MediaCinemaRAW v3 container reader.
-// Mirrors the encoder-side ContainerWriter API shape but does not share
-// code with any third-party decoder. Only the C++ standard library is used;
+// Independent MediaCinemaRAW v3 container reader.
+// Mirrors the encoder-side ContainerWriter API shape. Only the C++ standard
+// library is used;
 // JSON metadata is returned as raw strings so no JSON library is required.
 
 #include <cstdint>

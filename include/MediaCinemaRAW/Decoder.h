@@ -1,9 +1,9 @@
 #pragma once
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Clean-room MediaCinemaRAW frame decoder for compression type 7.
-// Written without copying third-party decoder source; it inverts the
-// documented packing described in MediaCinemaRAW-Encoder.
+// Independent MediaCinemaRAW frame decoder for compression type 7.
+// Written independently; it inverts the documented packing described in
+// MediaCinemaRAW-Encoder.
 
 #include <cstddef>
 #include <cstdint>

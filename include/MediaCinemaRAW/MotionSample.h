@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Clean-room motion-sample layout for MediaCinemaRAW containers.
+// Independent motion-sample layout for MediaCinemaRAW containers.
 // 24 bytes on the wire: int64 timestamp, three float axes, u32 reserved.
 
 #include <cstddef>

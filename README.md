@@ -4,12 +4,24 @@ A portable C++17 decoder for the **MediaCinemaRAW** lossless RAW-frame format.
 It decodes compression type 7 frame payloads and reads version-3 `.mcraw`
 containers (frames, PCM16 audio, gyro, accelerometer).
 
-This is an independent **clean-room implementation**. It was written without
-copying decoder source code. The separate
-[`motioncam-decoder`](https://github.com/mirsadm/motioncam-decoder) project and
-the sibling `MediaCinemaRAW-Encoder` checkout are used only as external
-interoperability test oracles and are not included in this repository or
-linked into the decoder library.
+This is an independent decoder implementation. During development, the separate
+[`motioncam-decoder`](https://github.com/mirsadm/motioncam-decoder) project was
+consulted as a reference for understanding the `.mcraw` container format,
+metadata structures, and expected decoder behavior, and the sibling
+`MediaCinemaRAW-Encoder` checkout is also used for interoperability testing.
+
+The decoder code in this repository was written independently and does not
+include or link against `motioncam-decoder`. No decoder source code was
+intentionally copied. Because the reference implementation was inspected
+during development, however, this project does **not** claim to be a formal
+clean-room implementation.
+
+The sibling encoder project discloses the same relationship: it is an
+independent decoder-compatible encoder implementation developed with the
+reference consulted for format, metadata, and behavior understanding plus
+interoperability testing, written independently with no include/link against
+`motioncam-decoder` and no intentional copying, likewise not claiming formal
+clean-room status. See [FAQ](FAQ.md).
 
 ## Features
 

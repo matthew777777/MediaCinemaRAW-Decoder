@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Clean-room MediaCinemaRAW v3 container reader.
+// Independent MediaCinemaRAW v3 container reader.
 // Format knowledge comes from the encoder-side writer and public container
-// facts (magic, version, item ids). No third-party decoder code was copied.
+// facts (magic, version, item ids).
 
 #include <MediaCinemaRAW/ContainerReader.h>
 #include <MediaCinemaRAW/Decoder.h>

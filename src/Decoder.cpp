@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Clean-room inverse of the MediaCinemaRAW type-7 packing.
-// The layout is documented here from encoder-observed behavior; no
-// third-party decoder source was copied.
+// Independent inverse of the MediaCinemaRAW type-7 packing.
+// The layout is documented here from encoder-observed behavior.
 
 #include <MediaCinemaRAW/Decoder.h>
 
