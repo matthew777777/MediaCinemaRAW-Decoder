@@ -1,0 +1,10 @@
+/build/
+ /.idea/
+ /.vscode/
+.DS_Store
+*.o
+*.a
+*.so
+test.mcraw
+*.pgm
+*.wav
