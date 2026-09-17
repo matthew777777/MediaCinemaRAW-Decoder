@@ -81,6 +81,11 @@ downscale, stride, constant blocks, and supported bit widths. Each payload is
 encoded with the reference encoder and decoded here pixel-for-pixel, plus a
 container round-trip (frames, audio, gyro) through the encoder writer.
 
+## FAQ
+
+See [FAQ](FAQ.md) for the shared whole-project FAQ covering the encoder,
+decoder, format, troubleshooting, and DNG export notes.
+
 ## License
 
 GPL-3.0-only. See [LICENSE](LICENSE).
