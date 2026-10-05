@@ -25,15 +25,15 @@ clean-room status. See [FAQ](FAQ.md).
 
 ## Features
 
-- Lossless type-7 frame decoding (`1/2/3/4/5/6/8/10/16`-bit blocks + trivial blocks)
-- Padded-width handling (`(width+63)/64*64`) and Bayer reinterleaving
+- Lossless type-7 frame decoding, all block widths plus trivial blocks
+- Padded-width handling and Bayer reinterleaving
 - Version-3 container reader with frame/audio/gyro/accelerometer indexes
 - OIS and unknown item skipping, strict offset/size validation
-- ARM NEON fast paths with a portable scalar fallback
-- No runtime dependencies beyond the C++ standard library (JSON is returned as raw strings)
+- ARM NEON and x86 SSE2 acceleration with a portable scalar fallback
+- No runtime dependencies beyond the C++ standard library
 
-Legacy compression type 6 is rejected with a clear error; only type 7 is supported,
-matching the encoder.
+Legacy compression type 6 is rejected with a clear error; only type 7 is
+supported, matching the encoder.
 
 ## Build and test
 
@@ -42,6 +42,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Options: `MEDIACINEMARAW_BUILD_TESTS` (default ON),
+`MEDIACINEMARAW_BUILD_TOOLS` (default ON), and
+`MEDIACINEMARAW_ENCODER_DIR` (path to a MediaCinemaRAW-Encoder checkout,
+enables the encode/decode round-trip suite in ctest).
 
 To run the full interoperability suite against a separate encoder checkout:
 
@@ -86,11 +91,21 @@ Frame and container metadata are returned as JSON strings. Parse `width`,
 `height`, and `compressionType` from the frame JSON; container audio rate and
 channels are available via `audioSampleRateHz()` / `numAudioChannels()`.
 
+## Layout
+
+- `include/MediaCinemaRAW/` — public headers (`Decoder.h`, `ContainerReader.h`,
+  `MotionSample.h`)
+- `src/` — `Decoder.cpp`, `ContainerReader.cpp`, plus private `detail/`
+  internals (SIMD helpers, delta unpacking, tile loop, container constants)
+- `tests/` — self-contained validation suite plus the sibling-encoder interop driver
+- `docs/` — [payload](docs/FORMAT.md) and [container](docs/CONTAINER.md) format notes
+- `tools/` — `mcraw_dump` inspection tool and the interop verification script
+
 ## Format compatibility
 
 Interop covers 240 deterministic combinations of RAW16, RAW10, crop,
 downscale, stride, constant blocks, and supported bit widths. Each payload is
-encoded with the reference encoder and decoded here pixel-for-pixel, plus a
+encoded with the sibling encoder and decoded here pixel-for-pixel, plus a
 container round-trip (frames, audio, gyro) through the encoder writer.
 
 ## FAQ

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Independent MediaCinemaRAW v3 container reader.
-// Format knowledge comes from the encoder-side writer and public container
-// facts (magic, version, item ids).
-
+// Independent MediaCinemaRAW v3 container reader: frame/audio/motion index
+// discovery plus on-demand payload loading. Wire constants live in
+// detail/ContainerFormat.h; the item-kind dispatch below is internal, since
+// the encoder repo defines its own overlapping write-side constants.
 #include <MediaCinemaRAW/ContainerReader.h>
 #include <MediaCinemaRAW/Decoder.h>
 
@@ -12,33 +12,27 @@
 #include <cstring>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
-#if defined(_WIN32)
-#include <stdio.h>
-#define MCRAW_SEEK _fseeki64
-#define MCRAW_TELL _ftelli64
-#else
-#define MCRAW_SEEK fseeko
-#define MCRAW_TELL ftello
-#endif
+#include "detail/ContainerFormat.h"
+#include "detail/Endian.h"
 
 namespace mediacinemaraw {
 namespace {
 
-constexpr uint8_t kMagic[7] = {'M', 'O', 'T', 'I', 'O', 'N', ' '};
-constexpr uint8_t kVersion = 3;
-constexpr uint32_t kFooterMagic = 0x8A905612;
-constexpr int kType7 = 7;
-
+// Item kinds on the wire. Type 7 is unused; 10/11 (OIS) are skipped, never
+// surfaced; anything unrecognized ends the auxiliary scan the way the
+// reference reader does.
 enum ItemKind : uint32_t {
-    kIndex = 0,
-    kIndexData = 1,
-    kFrame = 2,
-    kMeta = 3,
+    kFooter = 0,
+    kFrameIndex = 1,
+    kFrameData = 2,
+    kMetadata = 3,
     kAudioIndex = 4,
     kAudioData = 5,
-    kAudioMeta = 6,
+    kAudioTimestamp = 6,
     kAudioF32 = 7,
     kGyroIndex = 8,
     kGyroData = 9,
@@ -48,252 +42,341 @@ enum ItemKind : uint32_t {
     kAccelData = 13,
 };
 
-struct RawOffset {
-    int64_t off = 0;
-    int64_t ts = 0;
+struct IndexEntry {
+    int64_t offset = 0;
+    int64_t timestampNs = 0;
 };
-
-uint32_t getU32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-int64_t getI64(const uint8_t* p) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[i]) << (8 * i);
-    int64_t out = 0;
-    std::memcpy(&out, &v, 8);
-    return out;
-}
-
-int64_t tellNow(FILE* f) {
-    const int64_t p = static_cast<int64_t>(MCRAW_TELL(f));
-    if (p < 0) throw std::runtime_error("tell failed");
-    return p;
-}
-
-void seekTo(FILE* f, int64_t pos) {
-    if (pos < 0 || MCRAW_SEEK(f, static_cast<off_t>(pos), SEEK_SET) != 0)
-        throw std::runtime_error("seek failed");
-}
-
-void skipAhead(FILE* f, int64_t delta) {
-    if (delta < 0) throw std::runtime_error("negative skip");
-    if (MCRAW_SEEK(f, static_cast<off_t>(delta), SEEK_CUR) != 0)
-        throw std::runtime_error("skip failed");
-}
-
-void readFully(FILE* f, void* dst, size_t n) {
-    if (n == 0) return;
-    if (std::fread(dst, 1, n, f) != n) throw std::runtime_error("short read");
-}
 
 struct ItemHead {
     uint32_t kind = 0;
     uint32_t size = 0;
 };
 
-ItemHead readHead(FILE* f) {
-    uint8_t b[8];
-    readFully(f, b, 8);
-    return {getU32(b), getU32(b + 4)};
+#if defined(_WIN32)
+int SeekBy(FILE* handle, int64_t offset, int origin) {
+    return _fseeki64(handle, offset, origin);
 }
+int64_t TellAt(FILE* handle) {
+    return _ftelli64(handle);
+}
+#else
+int SeekBy(FILE* handle, int64_t offset, int origin) {
+    return fseeko(handle, static_cast<off_t>(offset), origin);
+}
+int64_t TellAt(FILE* handle) {
+    return static_cast<int64_t>(ftello(handle));
+}
+#endif
 
-// Minimal integer extractor for flat JSON: finds "key" then ':' then an
-// optional sign and decimal digits. Returns false when absent/malformed.
-bool jsonInt(const std::string& doc, const char* key, long long& value) {
+// RAII file handle with checked positioning. Reads stream from disk, so
+// large clips are never fully loaded; every seek and read is bounds
+// checked against the file size discovered at open.
+class File {
+  public:
+    explicit File(const std::string& path) {
+        handle_ = std::fopen(path.c_str(), "rb");
+        if (handle_ == nullptr)
+            throw std::runtime_error("cannot open " + path);
+    }
+    ~File() {
+        if (handle_ != nullptr)
+            std::fclose(handle_);
+    }
+    File(const File&) = delete;
+    File& operator=(const File&) = delete;
+
+    int64_t Size() {
+        if (SeekBy(handle_, 0, SEEK_END) != 0)
+            throw std::runtime_error("size failed");
+        return Tell();
+    }
+    int64_t Tell() {
+        const int64_t pos = TellAt(handle_);
+        if (pos < 0)
+            throw std::runtime_error("tell failed");
+        return pos;
+    }
+    void SeekTo(int64_t pos) {
+        if (pos < 0 || SeekBy(handle_, pos, SEEK_SET) != 0)
+            throw std::runtime_error("seek failed");
+    }
+    void Skip(int64_t delta) {
+        if (delta < 0)
+            throw std::runtime_error("negative skip");
+        if (SeekBy(handle_, delta, SEEK_CUR) != 0)
+            throw std::runtime_error("skip failed");
+    }
+    void Read(void* dst, size_t n) {
+        if (n == 0)
+            return;
+        if (std::fread(dst, 1, n, handle_) != n)
+            throw std::runtime_error("short read");
+    }
+    ItemHead ReadHeader() {
+        uint8_t bytes[detail::kItemHeaderSize];
+        Read(bytes, sizeof(bytes));
+        return {detail::LoadU32LE(bytes), detail::LoadU32LE(bytes + 4)};
+    }
+    // Header peek for optional trailing items: false on a short read, with
+    // the cursor left wherever the read ended.
+    bool TryReadHeader(ItemHead& head) {
+        uint8_t bytes[detail::kItemHeaderSize];
+        if (std::fread(bytes, 1, sizeof(bytes), handle_) != sizeof(bytes))
+            return false;
+        head = {detail::LoadU32LE(bytes), detail::LoadU32LE(bytes + 4)};
+        return true;
+    }
+
+  private:
+    FILE* handle_ = nullptr;
+};
+
+// Minimal integer extractor for flat JSON: finds "key", then ':', then an
+// optional sign and decimal digits. False when absent or malformed.
+bool FindJsonInteger(const std::string& doc, const char* key, long long& value) {
     const std::string quoted = std::string("\"") + key + "\"";
-    const size_t k = doc.find(quoted);
-    if (k == std::string::npos) return false;
-    const size_t c = doc.find(':', k + quoted.size());
-    if (c == std::string::npos) return false;
-    size_t i = c + 1;
-    while (i < doc.size() && (doc[i] == ' ' || doc[i] == '\t' ||
-                              doc[i] == '\n' || doc[i] == '\r' ||
-                              doc[i] == '"'))
+    const size_t found = doc.find(quoted);
+    if (found == std::string::npos)
+        return false;
+    const size_t colon = doc.find(':', found + quoted.size());
+    if (colon == std::string::npos)
+        return false;
+    size_t i = colon + 1;
+    while (i < doc.size() &&
+           (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\n' || doc[i] == '\r' || doc[i] == '"'))
         ++i;
-    bool neg = false;
+    bool negative = false;
     if (i < doc.size() && (doc[i] == '-' || doc[i] == '+')) {
-        neg = doc[i] == '-';
+        negative = doc[i] == '-';
         ++i;
     }
-    if (i >= doc.size() || doc[i] < '0' || doc[i] > '9') return false;
-    long long v = 0;
-    while (i < doc.size() && doc[i] >= '0' && doc[i] <= '9') {
-        v = v * 10 + (doc[i] - '0');
-        ++i;
-    }
-    value = neg ? -v : v;
+    if (i >= doc.size() || doc[i] < '0' || doc[i] > '9')
+        return false;
+    long long parsed = 0;
+    while (i < doc.size() && doc[i] >= '0' && doc[i] <= '9')
+        parsed = parsed * 10 + (doc[i++] - '0');
+    value = negative ? -parsed : parsed;
     return true;
 }
 
-}  // namespace
+} // namespace
 
 struct ContainerReader::Impl {
-    FILE* handle = nullptr;
-    std::string containerJson;
-    std::vector<int64_t> ordered;
-    std::map<int64_t, int64_t> byTime;
-    std::vector<RawOffset> audio;
-    std::vector<RawOffset> gyro;
-    std::vector<RawOffset> accel;
-    int64_t fileSize = 0;
-
-    ~Impl() {
-        if (handle) std::fclose(handle);
+    explicit Impl(const std::string& path) : file(path) {
+        fileSize = file.Size();
+        file.SeekTo(0);
+        const int64_t dataStart = ReadContainerHeader();
+        const int64_t listHead = ReadFrameIndex(dataStart);
+        ScanAuxiliaryIndexes(dataStart, listHead);
     }
-};
 
-ContainerReader::ContainerReader(const std::string& path)
-    : impl_(new Impl()) {
-    Impl& st = *impl_;
-    st.handle = std::fopen(path.c_str(), "rb");
-    if (!st.handle) throw std::runtime_error("cannot open " + path);
-    FILE* f = st.handle;
-    try {
-        if (MCRAW_SEEK(f, 0, SEEK_END) != 0) throw std::runtime_error("size failed");
-        st.fileSize = tellNow(f);
-        seekTo(f, 0);
+    // File header plus the container-level JSON. Returns the offset where
+    // the frame/audio/motion items start.
+    int64_t ReadContainerHeader() {
+        uint8_t header[8];
+        file.Read(header, sizeof(header));
+        if (std::memcmp(header, detail::kFileMagic, 7) != 0)
+            throw std::runtime_error("bad magic");
+        if (header[7] != detail::kFileMagic[7])
+            throw std::runtime_error("bad container version");
 
-        uint8_t hdr[8];
-        readFully(f, hdr, 8);
-        if (std::memcmp(hdr, kMagic, 7) != 0) throw std::runtime_error("bad magic");
-        if (hdr[7] != kVersion) throw std::runtime_error("bad container version");
+        const ItemHead first = file.ReadHeader();
+        if (first.kind != kMetadata)
+            throw std::runtime_error("missing container metadata");
+        if (first.size > detail::kMaxContainerMetadata)
+            throw std::runtime_error("metadata too large");
+        if (file.Tell() + first.size > fileSize)
+            throw std::runtime_error("truncated metadata");
+        containerJson.assign(first.size, '\0');
+        file.Read(containerJson.data(), first.size);
+        return file.Tell();
+    }
 
-        const ItemHead first = readHead(f);
-        if (first.kind != kMeta) throw std::runtime_error("missing container metadata");
-        if (first.size > 8 * 1024 * 1024) throw std::runtime_error("metadata too large");
-        if (tellNow(f) + first.size > st.fileSize) throw std::runtime_error("truncated metadata");
-        st.containerJson.assign(first.size, '\0');
-        readFully(f, st.containerJson.data(), first.size);
-
-        const int64_t dataStart = tellNow(f);
-        if (st.fileSize < dataStart + 24 + 8)
+    // Footer plus the frame-offset list it points at. Returns the offset of
+    // the frame-index item header, which bounds the auxiliary scan.
+    int64_t ReadFrameIndex(int64_t dataStart) {
+        // At minimum the file holds one item header ahead of the footer.
+        const int64_t footerItem =
+            static_cast<int64_t>(detail::kItemHeaderSize + detail::kFooterPayloadSize);
+        const int64_t headerSize = static_cast<int64_t>(detail::kItemHeaderSize);
+        if (fileSize < dataStart + headerSize + footerItem)
             throw std::runtime_error("file too short for index");
 
-        // Footer: [item(0,16)][magic u32][count u32][indexOff i64].
-        seekTo(f, st.fileSize - 24);
-        const ItemHead foot = readHead(f);
-        if (foot.kind != kIndex || foot.size != 16)
+        file.SeekTo(fileSize - footerItem);
+        const ItemHead foot = file.ReadHeader();
+        if (foot.kind != kFooter || foot.size != detail::kFooterPayloadSize)
             throw std::runtime_error("missing footer index");
-        uint8_t fpay[16];
-        readFully(f, fpay, 16);
-        if (getU32(fpay) != kFooterMagic) throw std::runtime_error("bad footer magic");
-        const uint32_t nFrames = getU32(fpay + 4);
-        const int64_t listOff = getI64(fpay + 8);
-        if (nFrames > 4000000) throw std::runtime_error("implausible frame count");
-        const uint64_t listBytes = static_cast<uint64_t>(nFrames) * 16;
-        if (listOff < dataStart || listOff < 0)
+        uint8_t footer[detail::kFooterPayloadSize];
+        file.Read(footer, sizeof(footer));
+        if (detail::LoadU32LE(footer) != detail::kFooterMagic)
+            throw std::runtime_error("bad footer magic");
+        const uint32_t frameCount = detail::LoadU32LE(footer + 4);
+        const int64_t listOffset = detail::LoadI64LE(footer + 8);
+        if (frameCount > detail::kMaxFrameCount)
+            throw std::runtime_error("implausible frame count");
+        const uint64_t listBytes = static_cast<uint64_t>(frameCount) * detail::kFrameIndexEntrySize;
+        if (listOffset < dataStart || listOffset < 0)
             throw std::runtime_error("bad frame list offset");
-        if (listOff + static_cast<int64_t>(listBytes) + 24 != st.fileSize)
+        if (listOffset + static_cast<int64_t>(listBytes) + footerItem != fileSize)
             throw std::runtime_error("frame list does not abut footer");
-        const int64_t listHead = listOff - 8;
-        if (listHead < dataStart) throw std::runtime_error("bad frame index header");
-        seekTo(f, listHead);
-        const ItemHead listItem = readHead(f);
-        if (listItem.kind != kIndexData ||
-            listItem.size != listBytes)
+        const int64_t listHead = listOffset - headerSize;
+        if (listHead < dataStart)
+            throw std::runtime_error("bad frame index header");
+        file.SeekTo(listHead);
+        const ItemHead listItem = file.ReadHeader();
+        if (listItem.kind != kFrameIndex || listItem.size != listBytes)
             throw std::runtime_error("bad frame index item");
 
-        std::vector<RawOffset> frames(nFrames);
-        for (uint32_t i = 0; i < nFrames; ++i) {
-            uint8_t e[16];
-            readFully(f, e, 16);
-            frames[i].off = getI64(e);
-            frames[i].ts = getI64(e + 8);
-            if (frames[i].off < dataStart || frames[i].off >= listHead)
+        std::vector<IndexEntry> frames(frameCount);
+        for (uint32_t i = 0; i < frameCount; ++i) {
+            uint8_t entry[detail::kFrameIndexEntrySize];
+            file.Read(entry, sizeof(entry));
+            frames[i].offset = detail::LoadI64LE(entry);
+            frames[i].timestampNs = detail::LoadI64LE(entry + 8);
+            if (frames[i].offset < dataStart || frames[i].offset >= listHead)
                 throw std::runtime_error("frame offset out of range");
         }
-        std::sort(frames.begin(), frames.end(),
-                  [](const RawOffset& a, const RawOffset& b) {
-                      return a.ts < b.ts;
-                  });
-        for (const auto& e : frames) {
-            if (st.byTime.count(e.ts)) throw std::runtime_error("duplicate timestamp");
-            st.byTime[e.ts] = e.off;
-            st.ordered.push_back(e.ts);
+        std::sort(frames.begin(), frames.end(), [](const IndexEntry& a, const IndexEntry& b) {
+            return a.timestampNs < b.timestampNs;
+        });
+        for (const auto& entry : frames) {
+            if (byTime.count(entry.timestampNs) != 0)
+                throw std::runtime_error("duplicate timestamp");
+            byTime[entry.timestampNs] = entry.offset;
+            ordered.push_back(entry.timestampNs);
         }
+        return listHead;
+    }
 
-        // Scan the pre-index region for audio/motion indexes.
-        seekTo(f, dataStart);
-        const int64_t scanEnd = listHead;
-        while (tellNow(f) + 8 <= scanEnd) {
-            const int64_t itemPos = tellNow(f);
-            uint8_t hb[8];
-            if (std::fread(hb, 1, 8, f) != 8) break;
-            const uint32_t kind = getU32(hb);
-            const uint32_t size = getU32(hb + 4);
-            const int64_t remain = scanEnd - (itemPos + 8);
-            if (size > remain || size > (1u << 30))
+    // Linear scan of the pre-index region for the audio and motion indexes.
+    // Payload items are skipped by size; an unknown kind ends the scan.
+    void ScanAuxiliaryIndexes(int64_t dataStart, int64_t scanEnd) {
+        const int64_t headerSize = static_cast<int64_t>(detail::kItemHeaderSize);
+        file.SeekTo(dataStart);
+        while (file.Tell() + headerSize <= scanEnd) {
+            const int64_t itemPos = file.Tell();
+            ItemHead head;
+            if (!file.TryReadHeader(head))
+                break;
+            const int64_t remain = scanEnd - (itemPos + headerSize);
+            if (head.size > remain || head.size > detail::kMaxScanItem)
                 throw std::runtime_error("item size out of range");
-            switch (kind) {
-                case kFrame:
-                case kMeta:
+            switch (head.kind) {
+                case kFrameData:
+                case kMetadata:
                 case kAudioData:
-                case kAudioMeta:
+                case kAudioTimestamp:
                 case kAudioF32:
                 case kGyroData:
                 case kOisData:
                 case kAccelData:
-                    skipAhead(f, size);
-                    break;
-                case kAudioIndex: {
-                    if (size < 16) throw std::runtime_error("bad audio index");
-                    uint8_t pre[16];
-                    readFully(f, pre, 16);
-                    const int64_t n = getI64(pre);
-                    // pre[8..16] is start timestamp ms, informational.
-                    if (n < 0 || n > 1000000) throw std::runtime_error("bad audio count");
-                    if (16 + static_cast<uint64_t>(n) * 16 != size)
-                        throw std::runtime_error("audio index size mismatch");
-                    st.audio.resize(static_cast<size_t>(n));
-                    for (int64_t i = 0; i < n; ++i) {
-                        uint8_t e[16];
-                        readFully(f, e, 16);
-                        st.audio[static_cast<size_t>(i)] = {getI64(e),
-                                                            getI64(e + 8)};
-                    }
-                    break;
-                }
-                case kGyroIndex:
-                case kAccelIndex: {
-                    if (size < 8) throw std::runtime_error("bad motion index");
-                    uint8_t pre[8];
-                    readFully(f, pre, 8);
-                    if (getU32(pre) != 1) throw std::runtime_error("bad motion index version");
-                    const uint32_t n = getU32(pre + 4);
-                    if (n > 100000) throw std::runtime_error("too many motion chunks");
-                    if (8 + static_cast<uint64_t>(n) * 16 != size)
-                        throw std::runtime_error("motion index size mismatch");
-                    std::vector<RawOffset> tmp(n);
-                    for (uint32_t i = 0; i < n; ++i) {
-                        uint8_t e[16];
-                        readFully(f, e, 16);
-                        tmp[i] = {getI64(e), getI64(e + 8)};
-                    }
-                    if (kind == kGyroIndex)
-                        st.gyro = std::move(tmp);
-                    else
-                        st.accel = std::move(tmp);
-                    break;
-                }
                 case kOisIndex:
-                    skipAhead(f, size);
+                    file.Skip(head.size);
+                    break;
+                case kAudioIndex:
+                    ReadAudioIndex(head.size);
+                    break;
+                case kGyroIndex:
+                    ReadMotionIndex(head.size, gyro);
+                    break;
+                case kAccelIndex:
+                    ReadMotionIndex(head.size, accel);
                     break;
                 default:
                     // Unknown or footer area: stop like the reference reader.
-                    MCRAW_SEEK(f, itemPos, SEEK_SET);
-                    goto scan_done;
+                    file.SeekTo(itemPos);
+                    return;
             }
         }
-    scan_done:;
-    } catch (...) {
-        // Impl destructor closes the file.
-        throw;
     }
-}
+
+    void ReadAudioIndex(uint32_t size) {
+        if (size < detail::kAudioIndexHeaderSize)
+            throw std::runtime_error("bad audio index");
+        uint8_t prefix[detail::kAudioIndexHeaderSize];
+        file.Read(prefix, sizeof(prefix));
+        const int64_t count = detail::LoadI64LE(prefix);
+        // prefix[8..16] is the start timestamp in ms, informational only.
+        if (count < 0 || count > detail::kMaxAudioChunks)
+            throw std::runtime_error("bad audio count");
+        if (detail::kAudioIndexHeaderSize + static_cast<uint64_t>(count) * detail::kFrameIndexEntrySize !=
+            size)
+            throw std::runtime_error("audio index size mismatch");
+        audio.resize(static_cast<size_t>(count));
+        for (int64_t i = 0; i < count; ++i) {
+            uint8_t entry[detail::kFrameIndexEntrySize];
+            file.Read(entry, sizeof(entry));
+            audio[static_cast<size_t>(i)] = {detail::LoadI64LE(entry),
+                                             detail::LoadI64LE(entry + 8)};
+        }
+    }
+
+    void ReadMotionIndex(uint32_t size, std::vector<IndexEntry>& index) {
+        if (size < detail::kMotionHeaderSize)
+            throw std::runtime_error("bad motion index");
+        uint8_t prefix[detail::kMotionHeaderSize];
+        file.Read(prefix, sizeof(prefix));
+        if (detail::LoadU32LE(prefix) != detail::kMotionVersion)
+            throw std::runtime_error("bad motion index version");
+        const uint32_t count = detail::LoadU32LE(prefix + 4);
+        if (count > detail::kMaxMotionChunks)
+            throw std::runtime_error("too many motion chunks");
+        if (detail::kMotionHeaderSize + static_cast<uint64_t>(count) * detail::kFrameIndexEntrySize !=
+            size)
+            throw std::runtime_error("motion index size mismatch");
+        index.resize(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint8_t entry[detail::kFrameIndexEntrySize];
+            file.Read(entry, sizeof(entry));
+            index[i] = {detail::LoadI64LE(entry), detail::LoadI64LE(entry + 8)};
+        }
+    }
+
+    int64_t FrameOffset(int64_t timestamp) const {
+        const auto it = byTime.find(timestamp);
+        if (it == byTime.end())
+            throw std::runtime_error("frame not found");
+        return it->second;
+    }
+
+    // Shared gyro/accelerometer loader; `name` selects the error strings.
+    void LoadMotionSamples(const std::vector<IndexEntry>& index, uint32_t dataKind, const char* name,
+                           std::vector<MotionSample>& out) const {
+        for (const auto& entry : index) {
+            file.SeekTo(entry.offset);
+            const ItemHead head = file.ReadHeader();
+            if (head.kind != dataKind || head.size < detail::kMotionHeaderSize)
+                throw std::runtime_error(std::string("expected ") + name + " data");
+            if (head.size > detail::kMaxMotionData)
+                throw std::runtime_error(std::string(name) + " chunk too large");
+            uint8_t prefix[detail::kMotionHeaderSize];
+            file.Read(prefix, sizeof(prefix));
+            if (detail::LoadU32LE(prefix) != detail::kMotionVersion)
+                throw std::runtime_error(std::string("bad ") + name + " version");
+            const uint32_t count = detail::LoadU32LE(prefix + 4);
+            if (count == 0 ||
+                detail::kMotionHeaderSize + static_cast<uint64_t>(count) * detail::kMotionSampleWireSize !=
+                    head.size)
+                throw std::runtime_error(std::string(name) + " size mismatch");
+            if (count > out.max_size() - out.size())
+                throw std::runtime_error(std::string("too many ") + name + " samples");
+            const size_t base = out.size();
+            out.resize(base + count);
+            file.Read(out.data() + base, static_cast<size_t>(count) * detail::kMotionSampleWireSize);
+        }
+    }
+
+    mutable File file;
+    std::string containerJson;
+    std::vector<int64_t> ordered;
+    std::map<int64_t, int64_t> byTime;
+    std::vector<IndexEntry> audio;
+    std::vector<IndexEntry> gyro;
+    std::vector<IndexEntry> accel;
+    int64_t fileSize = 0;
+};
+
+ContainerReader::ContainerReader(const std::string& path) : impl_(new Impl(path)) {}
 
 ContainerReader::~ContainerReader() = default;
 
@@ -305,102 +388,107 @@ const std::vector<int64_t>& ContainerReader::frameTimestamps() const noexcept {
     return impl_->ordered;
 }
 
-void ContainerReader::loadFrameMetadata(int64_t timestamp,
-                                        std::string& out) const {
-    FILE* f = impl_->handle;
-    const auto it = impl_->byTime.find(timestamp);
-    if (it == impl_->byTime.end()) throw std::runtime_error("frame not found");
-    seekTo(f, it->second);
-    const ItemHead buf = readHead(f);
-    if (buf.kind != kFrame) throw std::runtime_error("expected frame item");
-    if (tellNow(f) + buf.size > impl_->fileSize)
+void ContainerReader::loadFrameMetadata(int64_t timestamp, std::string& out) const {
+    Impl& state = *impl_;
+    state.file.SeekTo(state.FrameOffset(timestamp));
+    const ItemHead frame = state.file.ReadHeader();
+    if (frame.kind != kFrameData)
+        throw std::runtime_error("expected frame item");
+    if (state.file.Tell() + frame.size > state.fileSize)
         throw std::runtime_error("truncated frame");
-    skipAhead(f, buf.size);
-    const ItemHead meta = readHead(f);
-    if (meta.kind != kMeta) throw std::runtime_error("expected frame metadata");
-    if (meta.size > 4 * 1024 * 1024) throw std::runtime_error("frame metadata too large");
+    state.file.Skip(frame.size);
+    const ItemHead meta = state.file.ReadHeader();
+    if (meta.kind != kMetadata)
+        throw std::runtime_error("expected frame metadata");
+    if (meta.size > detail::kMaxFrameMetadata)
+        throw std::runtime_error("frame metadata too large");
     out.assign(meta.size, '\0');
-    readFully(f, out.data(), meta.size);
+    state.file.Read(out.data(), meta.size);
 }
 
 void ContainerReader::loadFrame(int64_t timestamp, Frame& out) const {
-    FILE* f = impl_->handle;
-    const auto it = impl_->byTime.find(timestamp);
-    if (it == impl_->byTime.end()) throw std::runtime_error("frame not found");
-    seekTo(f, it->second);
-    const ItemHead buf = readHead(f);
-    if (buf.kind != kFrame) throw std::runtime_error("expected frame item");
-    if (buf.size > 256 * 1024 * 1024) throw std::runtime_error("frame too large");
-    std::vector<uint8_t> payload(buf.size);
-    readFully(f, payload.data(), payload.size());
-    const ItemHead meta = readHead(f);
-    if (meta.kind != kMeta) throw std::runtime_error("expected frame metadata");
-    if (meta.size > 4 * 1024 * 1024) throw std::runtime_error("frame metadata too large");
+    Impl& state = *impl_;
+    state.file.SeekTo(state.FrameOffset(timestamp));
+    const ItemHead frame = state.file.ReadHeader();
+    if (frame.kind != kFrameData)
+        throw std::runtime_error("expected frame item");
+    if (frame.size > detail::kMaxFramePayload)
+        throw std::runtime_error("frame too large");
+    std::vector<uint8_t> payload(frame.size);
+    state.file.Read(payload.data(), payload.size());
+    const ItemHead meta = state.file.ReadHeader();
+    if (meta.kind != kMetadata)
+        throw std::runtime_error("expected frame metadata");
+    if (meta.size > detail::kMaxFrameMetadata)
+        throw std::runtime_error("frame metadata too large");
     out.metadata.assign(meta.size, '\0');
-    readFully(f, out.metadata.data(), meta.size);
+    state.file.Read(out.metadata.data(), meta.size);
 
-    long long w = 0, h = 0, ct = -1;
-    if (!jsonInt(out.metadata, "width", w) ||
-        !jsonInt(out.metadata, "height", h) ||
-        !jsonInt(out.metadata, "compressionType", ct))
+    long long width = 0, height = 0, compression = -1;
+    if (!FindJsonInteger(out.metadata, "width", width) ||
+        !FindJsonInteger(out.metadata, "height", height) ||
+        !FindJsonInteger(out.metadata, "compressionType", compression))
         throw std::runtime_error("frame metadata lacks width/height/compressionType");
-    if (ct != kType7) throw std::runtime_error("unsupported compression type (only 7)");
-    if (w <= 0 || w > 65536 || h <= 0 || h > 65536)
+    if (compression != detail::kCompressionType7)
+        throw std::runtime_error("unsupported compression type (only 7)");
+    if (width <= 0 || width > 65536 || height <= 0 || height > 65536)
         throw std::runtime_error("bad frame dimensions");
-    out.width = static_cast<int>(w);
-    out.height = static_cast<int>(h);
+    out.width = static_cast<int>(width);
+    out.height = static_cast<int>(height);
     decode(payload.data(), payload.size(), out.width, out.height, out.pixels);
 }
 
 int ContainerReader::audioSampleRateHz() const {
-    long long v = 0;
-    return jsonInt(impl_->containerJson, "audioSampleRate", v) && v > 0 &&
-                   v < 1000000
-               ? static_cast<int>(v)
+    long long value = 0;
+    return FindJsonInteger(impl_->containerJson, "audioSampleRate", value) && value > 0 &&
+                   value < 1000000
+               ? static_cast<int>(value)
                : 0;
 }
 
 int ContainerReader::numAudioChannels() const {
-    long long v = 0;
-    return jsonInt(impl_->containerJson, "audioChannels", v) && v > 0 && v < 64
-               ? static_cast<int>(v)
+    long long value = 0;
+    return FindJsonInteger(impl_->containerJson, "audioChannels", value) && value > 0 && value < 64
+               ? static_cast<int>(value)
                : 0;
 }
 
 void ContainerReader::loadAudio(std::vector<AudioChunk>& out) const {
-    FILE* f = impl_->handle;
+    Impl& state = *impl_;
     out.clear();
-    out.reserve(impl_->audio.size());
-    for (const auto& e : impl_->audio) {
-        seekTo(f, e.off);
-        const ItemHead head = readHead(f);
-        if (head.kind != kAudioData) throw std::runtime_error("expected audio data");
-        if (head.size % 2 != 0) throw std::runtime_error("odd audio size");
-        if (head.size > 64 * 1024 * 1024) throw std::runtime_error("audio chunk too large");
+    out.reserve(state.audio.size());
+    for (const auto& entry : state.audio) {
+        state.file.SeekTo(entry.offset);
+        const ItemHead head = state.file.ReadHeader();
+        if (head.kind != kAudioData)
+            throw std::runtime_error("expected audio data");
+        if (head.size % 2 != 0)
+            throw std::runtime_error("odd audio size");
+        if (head.size > detail::kMaxAudioChunk)
+            throw std::runtime_error("audio chunk too large");
         AudioChunk chunk;
         chunk.timestampNs = -1;
         chunk.samples.resize(head.size / 2);
         if (!chunk.samples.empty()) {
-            readFully(f, chunk.samples.data(), head.size);
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-            for (auto& s : chunk.samples) {
-                uint16_t u = 0;
-                std::memcpy(&u, &s, 2);
-                u = static_cast<uint16_t>((u >> 8) | (u << 8));
-                std::memcpy(&s, &u, 2);
+            state.file.Read(chunk.samples.data(), head.size);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+            for (auto& sample : chunk.samples) {
+                uint16_t word = 0;
+                std::memcpy(&word, &sample, 2);
+                word = static_cast<uint16_t>((word >> 8) | (word << 8));
+                std::memcpy(&sample, &word, 2);
             }
 #endif
         }
-        // Optional trailing timestamp item; rewind if it is something else.
-        uint8_t hb[8];
-        if (std::fread(hb, 1, 8, f) == 8) {
-            if (getU32(hb) == kAudioMeta && getU32(hb + 4) == 8) {
-                uint8_t tb[8];
-                readFully(f, tb, 8);
-                chunk.timestampNs = getI64(tb);
+        // Optional trailing timestamp item; rewind when it is something else.
+        ItemHead next;
+        if (state.file.TryReadHeader(next)) {
+            if (next.kind == kAudioTimestamp && next.size == detail::kAudioTimestampSize) {
+                uint8_t stamp[detail::kAudioTimestampSize];
+                state.file.Read(stamp, sizeof(stamp));
+                chunk.timestampNs = detail::LoadI64LE(stamp);
             } else {
-                if (MCRAW_SEEK(f, -8, SEEK_CUR) != 0)
-                    throw std::runtime_error("rewind failed");
+                state.file.SeekTo(state.file.Tell() - detail::kItemHeaderSize);
             }
         }
         out.push_back(std::move(chunk));
@@ -412,53 +500,15 @@ bool ContainerReader::hasGyroData() const noexcept {
 }
 
 void ContainerReader::loadGyroData(std::vector<MotionSample>& out) const {
-    FILE* f = impl_->handle;
-    for (const auto& e : impl_->gyro) {
-        seekTo(f, e.off);
-        const ItemHead head = readHead(f);
-        if (head.kind != kGyroData || head.size < 8)
-            throw std::runtime_error("expected gyro data");
-        if (head.size > 256 * 1024 * 1024) throw std::runtime_error("gyro chunk too large");
-        uint8_t pre[8];
-        readFully(f, pre, 8);
-        if (getU32(pre) != 1) throw std::runtime_error("bad gyro version");
-        const uint32_t n = getU32(pre + 4);
-        if (n == 0 || 8 + static_cast<uint64_t>(n) * 24 != head.size)
-            throw std::runtime_error("gyro size mismatch");
-        if (n > out.max_size() - out.size()) throw std::runtime_error("too many gyro samples");
-        const size_t base = out.size();
-        out.resize(base + n);
-        readFully(f, out.data() + base, static_cast<size_t>(n) * 24);
-    }
+    impl_->LoadMotionSamples(impl_->gyro, kGyroData, "gyro", out);
 }
 
 bool ContainerReader::hasAccelerometerData() const noexcept {
     return !impl_->accel.empty();
 }
 
-void ContainerReader::loadAccelerometerData(
-    std::vector<MotionSample>& out) const {
-    FILE* f = impl_->handle;
-    for (const auto& e : impl_->accel) {
-        seekTo(f, e.off);
-        const ItemHead head = readHead(f);
-        if (head.kind != kAccelData || head.size < 8)
-            throw std::runtime_error("expected accelerometer data");
-        if (head.size > 256 * 1024 * 1024)
-            throw std::runtime_error("accelerometer chunk too large");
-        uint8_t pre[8];
-        readFully(f, pre, 8);
-        if (getU32(pre) != 1)
-            throw std::runtime_error("bad accelerometer version");
-        const uint32_t n = getU32(pre + 4);
-        if (n == 0 || 8 + static_cast<uint64_t>(n) * 24 != head.size)
-            throw std::runtime_error("accelerometer size mismatch");
-        if (n > out.max_size() - out.size())
-            throw std::runtime_error("too many accelerometer samples");
-        const size_t base = out.size();
-        out.resize(base + n);
-        readFully(f, out.data() + base, static_cast<size_t>(n) * 24);
-    }
+void ContainerReader::loadAccelerometerData(std::vector<MotionSample>& out) const {
+    impl_->LoadMotionSamples(impl_->accel, kAccelData, "accelerometer", out);
 }
 
-}  // namespace mediacinemaraw
+} // namespace mediacinemaraw
