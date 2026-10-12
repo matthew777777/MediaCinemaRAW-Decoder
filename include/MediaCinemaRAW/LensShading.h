@@ -1,37 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// Container-level lens shading metadata for `.mcraw` clips: a coarse
-// per-channel gain grid that corrects vignetting and lens falloff.
+// Frame-level lens shading metadata, compatible with MotionCam Pro files
+// and MotionCam Tools: a per-frame gain grid correcting vignetting.
 //
-// Schema. The container JSON may carry one `lensShadingMap` object with
-// plain keys, so motioncam-decoder readers consume it through
-// nlohmann::json with no new dependency:
+// Schema. Each frame JSON may carry three keys (verified against
+// MotionCam Pro recordings and the MotionCam Tools renderer, which reads
+// them and bakes the correction into its DNG output):
 //
-//   "lensShadingMap": {"columns": 16, "rows": 12, "gains": [...]}
+//   "lensShadingMapWidth": 17, "lensShadingMapHeight": 13,
+//   "lensShadingMap": [[R...], [Gr...], [Gb...], [B...]]
 //
-// `columns`/`rows` are positive grid extents (at most 512 each). `gains`
-// holds exactly `columns * rows * 4` finite floats, each greater than zero,
-// in row-major order with four channel-interleaved gains per grid point:
-// index `(r * columns + c) * 4 + ch`, where `ch = (y % 2) * 2 + (x % 2)`
-// is the CFA tile position of the pixel. For `sensorArrangment "rggb"` the
-// channels are R, Gr, Gb, B in tile order. This matches the DNG GainMap
-// opcode sample order (MapPointsV x MapPointsH x MapPlanes), so DNG
-// exporters can copy `gains` into the opcode verbatim with map_planes 4,
-// spacing (width / columns, height / rows), and origin
-// (0.5 * width / columns, 0.5 * height / rows).
+// `lensShadingMap` holds exactly four nested planes, one per color
+// channel in Android color order: 0 = R, 1 = Gr (green in R rows),
+// 2 = Gb (green in B rows), 3 = B. Each plane holds exactly
+// `Width * Height` row-major finite floats, each greater than zero.
+// This is NOT CFA tile order: pixels map to planes through the
+// `sensorArrangment` value (`"rggb"`, `"bggr"`, `"grbg"`, or `"gbrg"`).
+// MotionCam Tools ignores a missing or malformed map (flat arrays,
+// strings, and ragged planes all render as if absent — verified), and
+// this parser likewise returns false, leaving its output untouched.
 //
 // Geometry. Grid point (c, r) sits at pixel-center coordinates
 // `x = (c + 0.5) * width / columns`, `y = (r + 0.5) * height / rows`,
-// where width/height are the encoded frame dimensions. The gain at a pixel
+// where width/height are the decoded frame dimensions. The gain at a pixel
 // is the bilinear interpolation of the four surrounding grid points,
 // edge-clamped so border pixels reuse the outer samples. Grids that are
 // one wide or one tall are constant along the degenerate axis.
 //
-// The map covers the encoded frame (post-crop, post-binning). When frames
+// The map covers the decoded frame (post-crop, post-binning). When frames
 // are cropped or 4x-downscaled, the producer must crop or resample the
 // sensor shading map to the encoded window before embedding it (see the
-// sibling encoder's `buildLensShadingJson()`); the decoder always applies
-// the map over the decoded width x height.
+// sibling encoder's `buildLensShadingJson()`).
 //
 // Correction. `applyLensShadingMap()` computes
 // `out = black + (in - black) * gain`, rounded to nearest and clamped to
@@ -39,9 +38,9 @@
 // light-proportional signal; the upper clamp keeps the full uint16 range
 // instead of clipping at the sensor white level.
 //
-// The shared section below (the struct, validation, and sampling) is
-// duplicated in the sibling encoder repository, which must not depend on
-// this one. Keep the two copies in sync.
+// The shared section below (the struct, validation, channel mapping, and
+// sampling) is duplicated in the sibling encoder repository, which must
+// not depend on this one. Keep the two copies in sync.
 #pragma once
 
 #include <clocale>
@@ -54,8 +53,9 @@
 
 namespace mediacinemaraw {
 
-// Coarse per-channel gain grid covering one encoded frame. See the schema
-// above for the `gains` layout.
+// Coarse per-channel gain grid covering one encoded frame: `columns` by
+// `rows` grid points with four color-interleaved gains each, index
+// `(r * columns + c) * 4 + ch`, channel order R, Gr, Gb, B.
 struct LensShadingMap {
     int columns = 0;
     int rows = 0;
@@ -64,8 +64,8 @@ struct LensShadingMap {
 
 namespace lensshading_detail {
 
-// Grid backstop: 512 x 512 x 4 gains stay under typical container sizes
-// while real sensor maps are an order of magnitude smaller.
+// Grid backstop: 512 x 512 x 4 gains stay under typical frame metadata
+// sizes while real sensor maps are an order of magnitude smaller.
 constexpr int kMaxGridExtent = 512;
 
 // Unchecked bilinear sample. The caller must have validated the map,
@@ -122,73 +122,59 @@ inline size_t SkipWs(const std::string& text, size_t i, size_t end) {
     return i;
 }
 
-// Matching '}' for the '{' at `open`; npos when unbalanced. String
-// literals (with backslash escapes) are skipped so braces inside text
-// don't count.
-inline size_t MatchObjectEnd(const std::string& text, size_t open) {
-    // size_t: the loop starts at the opening brace, so depth is at least 1
-    // before any decrement, and no document can overflow the counter.
-    size_t depth = 0;
-    bool inString = false;
-    bool escape = false;
-    for (size_t i = open; i < text.size(); ++i) {
-        const char c = text[i];
-        if (inString) {
-            if (escape)
-                escape = false;
-            else if (c == '\\')
-                escape = true;
-            else if (c == '"')
-                inString = false;
-            continue;
-        }
-        if (c == '"')
-            inString = true;
-        else if (c == '{')
-            ++depth;
-        else if (c == '}') {
-            if (--depth == 0)
-                return i;
-        }
+// Finds `"key"` (quoted, so a longer key sharing the prefix cannot match)
+// followed by a colon. Returns the position just past the colon, or npos.
+// Earlier matches that open no value (the key text as a bare value) are
+// skipped and the search continues.
+inline size_t FindKeyColon(const std::string& text, const std::string& quoted, size_t start) {
+    size_t search = start;
+    for (;;) {
+        const size_t found = text.find(quoted, search);
+        if (found == std::string::npos)
+            return std::string::npos;
+        const size_t i = SkipWs(text, found + quoted.size(), text.size());
+        if (i < text.size() && text[i] == ':')
+            return i + 1;
+        search = found + 1;
     }
-    return std::string::npos;
 }
 
-// Scoped integer member: finds `"key"` in [begin, end), then ':' and a
-// decimal integer terminated by ',', ']', or '}'. False when absent or
-// malformed. Values are capped early; members only hold small extents.
-inline bool FindMemberInt(const std::string& text, size_t begin, size_t end, const char* key,
-                          long long& value) {
+// Document-level integer member: a decimal integer terminated by ',' or
+// '}'. False when absent or malformed. Accumulation cannot overflow: the
+// value saturates instead, and the extent check rejects it downstream.
+inline bool FindDocInt(const std::string& text, const char* key, long long& value) {
     const std::string quoted = std::string("\"") + key + "\"";
-    const size_t found = text.find(quoted, begin);
-    if (found == std::string::npos || found >= end)
-        return false;
-    size_t i = SkipWs(text, found + quoted.size(), end);
-    if (i >= end || text[i] != ':')
-        return false;
-    i = SkipWs(text, i + 1, end);
-    bool negative = false;
-    if (i < end && (text[i] == '-' || text[i] == '+')) {
-        negative = text[i] == '-';
-        ++i;
-    }
-    if (i >= end || text[i] < '0' || text[i] > '9')
-        return false;
-    long long parsed = 0;
-    while (i < end && text[i] >= '0' && text[i] <= '9') {
-        parsed = parsed * 10 + (text[i++] - '0');
-        if (parsed > 1000000000LL)
+    size_t search = 0;
+    for (;;) {
+        const size_t after = FindKeyColon(text, quoted, search);
+        if (after == std::string::npos)
             return false;
+        size_t i = SkipWs(text, after, text.size());
+        bool negative = false;
+        if (i < text.size() && (text[i] == '-' || text[i] == '+')) {
+            negative = text[i] == '-';
+            ++i;
+        }
+        if (i >= text.size() || text[i] < '0' || text[i] > '9') {
+            search = after;
+            continue;
+        }
+        long long parsed = 0;
+        while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+            const int digit = text[i++] - '0';
+            if (parsed > (0x7FFFFFFFFFFFFFFFLL - digit) / 10)
+                parsed = 0x7FFFFFFFFFFFFFFFLL;
+            else
+                parsed = parsed * 10 + digit;
+        }
+        i = SkipWs(text, i, text.size());
+        if (i >= text.size() || (text[i] != ',' && text[i] != '}')) {
+            search = after;
+            continue;
+        }
+        value = negative ? -parsed : parsed;
+        return true;
     }
-    // The terminator may be the object's own closing brace at `end`, so this
-    // one skip is bounded by the document instead. It cannot run past `end`:
-    // the brace there is not whitespace, so the skip always stops at or
-    // before it.
-    i = SkipWs(text, i, text.size());
-    if (i >= text.size() || (text[i] != ',' && text[i] != ']' && text[i] != '}'))
-        return false;
-    value = negative ? -parsed : parsed;
-    return true;
 }
 
 inline bool IsFloatChar(char c) {
@@ -219,6 +205,58 @@ inline bool ParseFloatToken(const char* begin, const char* end, float& value) {
     return true;
 }
 
+// Parses one nested gain plane: '[' followed by exactly `plane` floats and
+// ']'. Advances `pos` past the closing bracket. False on any deviation,
+// including ragged counts and trailing commas.
+inline bool ParseGainPlane(const std::string& text, size_t& pos, float* channelGains,
+                           size_t plane) {
+    size_t j = SkipWs(text, pos, text.size());
+    if (j >= text.size() || text[j] != '[')
+        return false;
+    ++j;
+    bool expectValue = true;
+    size_t count = 0;
+    for (;;) {
+        j = SkipWs(text, j, text.size());
+        if (j >= text.size())
+            return false;
+        if (!expectValue && text[j] == ']') {
+            ++j;
+            break;
+        }
+        if (text[j] == ']' || text[j] == ',')
+            return false; // Empty plane, trailing comma, or bare comma.
+        size_t tokenEnd = j;
+        while (tokenEnd < text.size() && IsFloatChar(text[tokenEnd]))
+            ++tokenEnd;
+        float gain = 0.0f;
+        if (!ParseFloatToken(text.data() + j, text.data() + tokenEnd, gain) || gain <= 0.0f)
+            return false;
+        if (count >= plane)
+            return false;
+        channelGains[count * 4] = gain;
+        ++count;
+        expectValue = false;
+        j = SkipWs(text, tokenEnd, text.size());
+        if (j >= text.size())
+            return false;
+        if (text[j] == ',') {
+            ++j;
+            expectValue = true;
+            continue;
+        }
+        if (text[j] == ']') {
+            ++j;
+            break;
+        }
+        return false;
+    }
+    if (count != plane)
+        return false;
+    pos = j;
+    return true;
+}
+
 } // namespace lensshading_detail
 
 // Validates a map against the schema above. Throws std::invalid_argument
@@ -240,9 +278,29 @@ inline void validateLensShadingMap(const LensShadingMap& map) {
     }
 }
 
-// Samples one channel gain at pixel (x, y) of a width x height frame.
-// `channel` is the CFA tile position `(y % 2) * 2 + (x % 2)`; callers that
-// already know the pixel's channel pass it directly. Validates the map and
+// Maps pixel (x, y) to its color channel index (0 = R, 1 = Gr, 2 = Gb,
+// 3 = B) through the 2x2 CFA tile named by `sensorArrangement`, one of
+// `"rggb"`, `"bggr"`, `"grbg"`, `"gbrg"` (lowercase, as MotionCam writes
+// it). A green pixel in an R row is Gr, in a B row Gb. Only the pixel
+// parity matters. Throws std::invalid_argument on any other arrangement.
+inline int lensShadingChannelIndex(const std::string& sensorArrangement, int x, int y) {
+    if (sensorArrangement != "rggb" && sensorArrangement != "bggr" && sensorArrangement != "grbg" &&
+        sensorArrangement != "gbrg")
+        throw std::invalid_argument("lens shading sensor arrangement");
+    const int tx = ((x % 2) + 2) % 2;
+    const int ty = ((y % 2) + 2) % 2;
+    const char color = sensorArrangement[size_t(ty) * 2 + size_t(tx)];
+    if (color == 'r')
+        return 0;
+    if (color == 'b')
+        return 3;
+    const bool rowHasRed =
+        sensorArrangement[size_t(ty) * 2] == 'r' || sensorArrangement[size_t(ty) * 2 + 1] == 'r';
+    return rowHasRed ? 1 : 2;
+}
+
+// Samples one color-channel gain at pixel (x, y) of a width x height
+// frame; `channel` is 0 = R, 1 = Gr, 2 = Gb, 3 = B. Validates the map and
 // throws std::invalid_argument like validateLensShadingMap(), plus on bad
 // geometry, out-of-range coordinates, or a channel outside [0, 3].
 inline float lensShadingGainAt(const LensShadingMap& map, int x, int y, int width, int height,
@@ -257,98 +315,64 @@ inline float lensShadingGainAt(const LensShadingMap& map, int x, int y, int widt
     return lensshading_detail::SampleGain(map, x, y, width, height, channel);
 }
 
-// Parses the container-level `lensShadingMap` object out of `containerJson`
-// (as returned by `ContainerReader::containerMetadata()`). Members may
-// appear in any order and surrounding whitespace is allowed. Returns false
-// when the key is absent or the object is malformed — wrong extents, a
-// gain count other than `columns * rows * 4`, or a gain that is not finite
-// and positive — leaving `out` untouched. A structurally valid occurrence
-// decides the result, so a second `lensShadingMap` later in the document
-// is never consulted; a key-shaped match inside a string literal is
-// skipped and the search continues. No JSON library is used.
-inline bool parseLensShadingMap(const std::string& containerJson, LensShadingMap& out) {
-    const std::string& text = containerJson;
+// Parses the frame-level `lensShadingMapWidth` / `lensShadingMapHeight` /
+// `lensShadingMap` triplet out of `frameJson` (as returned by
+// `ContainerReader::loadFrameMetadata()`). Members may appear in any order
+// and surrounding whitespace is allowed; the map must be exactly four
+// nested planes of `Width * Height` floats each, all finite and positive.
+// Returns false when any key is absent or malformed, leaving `out`
+// untouched. A value of the wrong JSON type is skipped like an absent key
+// and the search continues, mirroring MotionCam Tools, which renders such
+// files as if the map were absent. No JSON library is used.
+inline bool parseLensShadingMap(const std::string& frameJson, LensShadingMap& out) {
+    const std::string& text = frameJson;
+    long long columns = 0, rows = 0;
+    if (!lensshading_detail::FindDocInt(text, "lensShadingMapWidth", columns) ||
+        !lensshading_detail::FindDocInt(text, "lensShadingMapHeight", rows))
+        return false;
+    if (columns < 1 || columns > lensshading_detail::kMaxGridExtent || rows < 1 ||
+        rows > lensshading_detail::kMaxGridExtent)
+        return false;
+    const size_t plane = static_cast<size_t>(columns) * static_cast<size_t>(rows);
     const std::string key = "\"lensShadingMap\"";
     size_t search = 0;
     for (;;) {
-        const size_t found = text.find(key, search);
-        if (found == std::string::npos)
+        const size_t after = lensshading_detail::FindKeyColon(text, key, search);
+        if (after == std::string::npos)
             return false;
-        size_t i = lensshading_detail::SkipWs(text, found + key.size(), text.size());
-        bool structural = false;
-        size_t objectEnd = std::string::npos;
-        if (i < text.size() && text[i] == ':') {
-            i = lensshading_detail::SkipWs(text, i + 1, text.size());
-            if (i < text.size() && text[i] == '{') {
-                objectEnd = lensshading_detail::MatchObjectEnd(text, i);
-                structural = objectEnd != std::string::npos;
-            }
-        }
-        if (!structural) {
-            // A key-shaped match that opens no object (a string literal, or
+        size_t j = lensshading_detail::SkipWs(text, after, text.size());
+        if (j >= text.size() || text[j] != '[') {
+            // A key-shaped match holding no array (a string, a number, or
             // `null`); keep looking.
-            search = found + 1;
+            search = after;
             continue;
         }
-        long long columns = 0, rows = 0;
-        if (!lensshading_detail::FindMemberInt(text, i, objectEnd, "columns", columns) ||
-            !lensshading_detail::FindMemberInt(text, i, objectEnd, "rows", rows))
-            return false;
-        if (columns < 1 || columns > lensshading_detail::kMaxGridExtent || rows < 1 ||
-            rows > lensshading_detail::kMaxGridExtent)
-            return false;
-        const std::string gainsKey = "\"gains\"";
-        const size_t gainsAt = text.find(gainsKey, i);
-        if (gainsAt == std::string::npos || gainsAt >= objectEnd)
-            return false;
-        size_t j = lensshading_detail::SkipWs(text, gainsAt + gainsKey.size(), objectEnd);
-        if (j >= objectEnd || text[j] != ':')
-            return false;
-        j = lensshading_detail::SkipWs(text, j + 1, objectEnd);
-        if (j >= objectEnd || text[j] != '[')
-            return false;
         ++j;
-        const size_t expected = static_cast<size_t>(columns) * static_cast<size_t>(rows) * 4;
-        std::vector<float> gains;
-        gains.reserve(expected);
-        bool expectValue = true;
-        for (;;) {
-            j = lensshading_detail::SkipWs(text, j, objectEnd);
-            if (j >= objectEnd)
-                return false;
-            if (!expectValue && text[j] == ']') {
-                ++j;
+        // The value opened an array, so this occurrence decides the result:
+        // anything malformed from here on fails instead of searching on.
+        std::vector<float> gains(plane * 4);
+        bool ok = true;
+        for (int ch = 0; ch < 4 && ok; ++ch) {
+            if (!lensshading_detail::ParseGainPlane(text, j, gains.data() + ch, plane)) {
+                ok = false;
                 break;
             }
-            if (text[j] == ']' || text[j] == ',')
-                return false; // Empty array, trailing comma, or bare comma.
-            size_t tokenEnd = j;
-            while (tokenEnd < objectEnd && lensshading_detail::IsFloatChar(text[tokenEnd]))
-                ++tokenEnd;
-            float gain = 0.0f;
-            if (!lensshading_detail::ParseFloatToken(text.data() + j, text.data() + tokenEnd,
-                                                     gain) ||
-                gain <= 0.0f)
-                return false;
-            if (gains.size() >= expected)
-                return false;
-            gains.push_back(gain);
-            expectValue = false;
-            j = lensshading_detail::SkipWs(text, tokenEnd, objectEnd);
-            if (j >= objectEnd)
-                return false;
-            if (text[j] == ',') {
-                ++j;
-                expectValue = true;
-                continue;
-            }
-            if (text[j] == ']') {
-                ++j;
+            j = lensshading_detail::SkipWs(text, j, text.size());
+            if (j >= text.size()) {
+                ok = false;
                 break;
             }
-            return false;
+            if (ch < 3 && text[j] != ',') {
+                ok = false;
+                break;
+            }
+            if (ch == 3 && text[j] != ']') {
+                ok = false;
+                break;
+            }
+            ++j;
         }
-        if (gains.size() != expected)
+        if (!ok)
             return false;
         out.columns = static_cast<int>(columns);
         out.rows = static_cast<int>(rows);
@@ -357,27 +381,34 @@ inline bool parseLensShadingMap(const std::string& containerJson, LensShadingMap
     }
 }
 
-// Applies lens shading correction in place: each pixel's channel gain is
-// the bilinear sample for its CFA tile position `(y % 2) * 2 + (x % 2)`
-// over the width x height frame, and the pixel becomes
-// `blackLevel + (pixel - blackLevel) * gain`, rounded to nearest and
-// clamped to [0, 65535]. Throws std::invalid_argument on bad geometry, a
-// pixel count other than `width * height`, an invalid map (like
-// validateLensShadingMap()), or a black level that is not finite and
+// Applies lens shading correction in place: each pixel's color channel
+// comes from `sensorArrangement` (see lensShadingChannelIndex()), its gain
+// is the bilinear sample for that channel over the width x height frame,
+// and the pixel becomes `blackLevel + (pixel - blackLevel) * gain`,
+// rounded to nearest and clamped to [0, 65535]. Throws
+// std::invalid_argument on bad geometry, a pixel count other than
+// `width * height`, an invalid map (like validateLensShadingMap()), an
+// unknown sensor arrangement, or a black level that is not finite and
 // non-negative.
 inline void applyLensShadingMap(std::vector<uint16_t>& pixels, int width, int height,
-                                const LensShadingMap& map, float blackLevel = 0.0f) {
+                                const LensShadingMap& map, const std::string& sensorArrangement,
+                                float blackLevel = 0.0f) {
     if (width <= 0 || height <= 0)
         throw std::invalid_argument("lens shading dimensions");
     if (pixels.size() != static_cast<size_t>(width) * static_cast<size_t>(height))
         throw std::invalid_argument("lens shading pixel count");
     validateLensShadingMap(map);
+    // Validates the arrangement once; the loop below reuses the tile.
+    int tile[2][2];
+    for (int ty = 0; ty < 2; ++ty)
+        for (int tx = 0; tx < 2; ++tx)
+            tile[ty][tx] = lensShadingChannelIndex(sensorArrangement, tx, ty);
     if (!std::isfinite(blackLevel) || blackLevel < 0.0f)
         throw std::invalid_argument("lens shading black level");
     const size_t stride = static_cast<size_t>(width);
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
-            const int channel = (y & 1) * 2 + (x & 1);
+            const int channel = tile[y & 1][x & 1];
             const float gain = lensshading_detail::SampleGain(map, x, y, width, height, channel);
             const float raw = static_cast<float>(
                 pixels[static_cast<size_t>(y) * stride + static_cast<size_t>(x)]);

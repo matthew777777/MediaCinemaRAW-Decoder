@@ -411,60 +411,90 @@ void TestContainerRejectsUnknownFrame() {
 
 void TestLensShadingParse() {
     mediacinemaraw::LensShadingMap map;
-    // Absent key: false, `out` untouched.
+    // Absent keys: false, `out` untouched.
     map.columns = 7;
     map.rows = 7;
     map.gains = {1.0f, 2.0f, 3.0f};
-    assert(!mediacinemaraw::parseLensShadingMap("{\"model\":\"X\"}", map));
+    assert(!mediacinemaraw::parseLensShadingMap("{\"width\":64,\"height\":8,\"compressionType\":7}",
+                                                map));
     assert(map.columns == 7 && map.rows == 7 && map.gains.size() == 3);
 
-    // Golden document in the encoder builder's exact output shape.
-    const std::string doc = "{\"model\":\"X\",\"lensShadingMap\":{\"columns\":2,\"rows\":1,"
-                            "\"gains\":[1,1.5,2,2.5,0.5,1.25,3,4]},\"extraData\":{}}";
+    // Golden document in the encoder builder's exact output shape. Nested
+    // R/Gr/Gb/B planes land interleaved.
+    const std::string doc =
+        "{\"width\":64,\"height\":8,\"compressionType\":7,\"lensShadingMapWidth\":2,"
+        "\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1,0.5],[1.5,1.25],[2,3],[2.5,4]]}";
     assert(mediacinemaraw::parseLensShadingMap(doc, map));
     assert(map.columns == 2 && map.rows == 1);
     assert((map.gains == std::vector<float>{1.0f, 1.5f, 2.0f, 2.5f, 0.5f, 1.25f, 3.0f, 4.0f}));
 
     // Members in any order, with whitespace and exponent notation.
-    const std::string shuffled = "{ \"lensShadingMap\" : { \"rows\" : 1 , \"gains\" : "
-                                 "[ 1e0 , 1.5 , 2 , 2.5 , .5 , 1.25 , 3 , 4 ] , "
-                                 "\"columns\" : 2 } }";
+    const std::string shuffled =
+        "{ \"lensShadingMap\" : [ [ 1e0 , .5 ] , [ 1.5 , 1.25 ] , [ 2 , 3 ] , [ 2.5 , 4 ] ] , "
+        "\"lensShadingMapHeight\" : 1 , \"lensShadingMapWidth\" : 2 }";
     assert(mediacinemaraw::parseLensShadingMap(shuffled, map));
     assert(map.columns == 2 && map.rows == 1);
     assert(map.gains[4] == 0.5f);
 
     // The encoder prints gains with %.9g; 0.1f prints as 0.100000001 and
     // must parse back to the identical float.
-    const std::string tenths = "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,"
-                               "\"gains\":[0.100000001,1,1,1]}}";
+    const std::string tenths = "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,"
+                               "\"lensShadingMap\":[[0.100000001],[1],[1],[1]]}";
     assert(mediacinemaraw::parseLensShadingMap(tenths, map));
     assert(map.gains[0] == 0.1f);
 
-    // A key-shaped match inside a string literal is skipped: the decoy
-    // holds the exact `"lensShadingMap":null` text but opens no object.
-    const std::string decoy = "{\"note\":\"the \\\"lensShadingMap\\\":null key\","
-                              "\"lensShadingMap\":{\"columns\":1,\"rows\":1,"
-                              "\"gains\":[1,1,1,1]}}";
+    // Key text as a bare value is skipped: the decoy matches the quoted
+    // key but opens no colon.
+    const std::string decoy = "{\"note\":\"lensShadingMapWidth\",\"lensShadingMapWidth\":1,"
+                              "\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],[1]]}";
     assert(mediacinemaraw::parseLensShadingMap(decoy, map));
+    assert(map.columns == 1 && map.rows == 1);
+
+    // A wrong-typed value is skipped like an absent key and the search
+    // continues, mirroring MotionCam Tools.
+    const std::string nulled = "{\"lensShadingMap\":null,\"lensShadingMapWidth\":1,"
+                               "\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],[1]]}";
+    assert(mediacinemaraw::parseLensShadingMap(nulled, map));
     assert(map.columns == 1 && map.rows == 1);
 
     // Every malformed shape fails without touching `out`.
     const char* badDocs[] = {
-        "{\"lensShadingMap\":null}",
-        "{\"lensShadingMap\":{\"columns\":2,\"rows\":1}}",          // No gains.
-        "{\"lensShadingMap\":{\"columns\":2,\"gains\":[1,1,1,1]}}", // No rows.
-        "{\"lensShadingMap\":{\"columns\":0,\"rows\":1,\"gains\":[1,1,1,1]}}",
-        "{\"lensShadingMap\":{\"columns\":513,\"rows\":1,\"gains\":[1,1,1,1]}}",
-        "{\"lensShadingMap\":{\"columns\":2,\"rows\":1,\"gains\":[1,1,1]}}",       // Short.
-        "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,\"gains\":[1,1,1,1,1]}}",   // Long.
-        "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,\"gains\":[1,1,1,0]}}",     // Zero.
-        "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,\"gains\":[1,1,1,-2]}}",    // Negative.
-        "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,\"gains\":[1,1,1,1e999]}}", // Infinite.
-        "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,\"gains\":[1,1,1,]}}",    // Trailing comma.
-        "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,\"gains\":[]}}",          // Empty.
-        "{\"lensShadingMap\":{\"columns\":1,\"rows\":1,\"gains\":1.5}}",         // Not an array.
-        "{\"lensShadingMap\":{\"columns\":1.5,\"rows\":1,\"gains\":[1,1,1,1]}}", // Float extent.
-        "{\"lensShadingMap\":{\"columns\":2,\"rows\":1,\"gains\":[1,1,1",        // Truncated.
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":null}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1}",            // No map.
+        "{\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],[1]]}", // No width.
+        "{\"lensShadingMapWidth\":0,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],[1]]"
+        "}",
+        "{\"lensShadingMapWidth\":513,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],["
+        "1]]}",
+        "{\"lensShadingMapWidth\":1.5,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],["
+        "1]]}",
+        "{\"lensShadingMapWidth\":\"1\",\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],"
+        "[1]]}",
+        // Flat array, even with the right total: planes must nest.
+        "{\"lensShadingMapWidth\":2,\"lensShadingMapHeight\":1,"
+        "\"lensShadingMap\":[1,1.5,2,2.5,0.5,1.25,3,4]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1]]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,"
+        "\"lensShadingMap\":[[1],[1],[1],[1],[1]]}",
+        "{\"lensShadingMapWidth\":2,\"lensShadingMapHeight\":1,"
+        "\"lensShadingMap\":[[1],[1.5,1.25],[2,3],[2.5,4]]}", // Ragged plane.
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1,1],[1],[1],["
+        "1]]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[0],[1],[1],[1]]"
+        "}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],[-2]"
+        "]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],["
+        "1e999]]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1,],[1],[1],[1]"
+        "]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1],[1],[1],[1],"
+        "]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[]}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[],[1],[1],[1]]"
+        "}",
+        "{\"lensShadingMapWidth\":1,\"lensShadingMapHeight\":1,\"lensShadingMap\":1.5}",
+        "{\"lensShadingMapWidth\":2,\"lensShadingMapHeight\":1,\"lensShadingMap\":[[1,0.5],[1.5",
     };
     for (const char* bad : badDocs) {
         map.columns = 7;
@@ -476,35 +506,60 @@ void TestLensShadingParse() {
 }
 
 void TestLensShadingApply() {
+    // Pixel-to-color mapping for every Bayer arrangement (shared helper,
+    // tested on this copy too).
+    assert(mediacinemaraw::lensShadingChannelIndex("rggb", 0, 0) == 0);
+    assert(mediacinemaraw::lensShadingChannelIndex("rggb", 1, 0) == 1);
+    assert(mediacinemaraw::lensShadingChannelIndex("rggb", 0, 1) == 2);
+    assert(mediacinemaraw::lensShadingChannelIndex("rggb", 1, 1) == 3);
+    assert(mediacinemaraw::lensShadingChannelIndex("bggr", 0, 0) == 3);
+    assert(mediacinemaraw::lensShadingChannelIndex("bggr", 1, 0) == 2);
+    assert(mediacinemaraw::lensShadingChannelIndex("bggr", 0, 1) == 1);
+    assert(mediacinemaraw::lensShadingChannelIndex("bggr", 1, 1) == 0);
+    assert(mediacinemaraw::lensShadingChannelIndex("grbg", 0, 0) == 1);
+    assert(mediacinemaraw::lensShadingChannelIndex("grbg", 1, 0) == 0);
+    assert(mediacinemaraw::lensShadingChannelIndex("grbg", 0, 1) == 3);
+    assert(mediacinemaraw::lensShadingChannelIndex("grbg", 1, 1) == 2);
+    assert(mediacinemaraw::lensShadingChannelIndex("gbrg", 0, 0) == 2);
+    assert(mediacinemaraw::lensShadingChannelIndex("gbrg", 1, 0) == 3);
+    assert(mediacinemaraw::lensShadingChannelIndex("gbrg", 0, 1) == 0);
+    assert(mediacinemaraw::lensShadingChannelIndex("gbrg", 1, 1) == 1);
+
     // Uniform 2x gain, zero black: values double.
     mediacinemaraw::LensShadingMap flat{2, 2, std::vector<float>(16, 2.0f)};
     std::vector<uint16_t> pixels = {100, 200, 300, 400};
-    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat);
+    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat, "rggb");
     assert((pixels == std::vector<uint16_t>{200, 400, 600, 800}));
 
     // Black-level formula: out = 64 + (in - 64) * 2; below-black clamps
     // at zero instead of wrapping.
     pixels = {64, 100, 0, 200};
-    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat, 64.0f);
+    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat, "rggb", 64.0f);
     assert((pixels == std::vector<uint16_t>{64, 136, 0, 336}));
 
     // Highlights clamp at the uint16 ceiling, not the sensor white level.
     mediacinemaraw::LensShadingMap one{1, 1, {2.0f, 2.0f, 2.0f, 2.0f}};
     pixels = {40000};
-    mediacinemaraw::applyLensShadingMap(pixels, 1, 1, one);
+    mediacinemaraw::applyLensShadingMap(pixels, 1, 1, one, "rggb");
     assert(pixels[0] == 65535);
 
-    // Channel selection follows the CFA tile: (y % 2) * 2 + (x % 2).
+    // rggb tile order matches color order R, Gr, Gb, B.
     mediacinemaraw::LensShadingMap channels{1, 1, {1.0f, 2.0f, 3.0f, 4.0f}};
     pixels = {100, 100, 100, 100};
-    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, channels);
+    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, channels, "rggb");
     assert((pixels == std::vector<uint16_t>{100, 200, 300, 400}));
+
+    // gbrg remaps to colors: Gb, B / R, Gr. Matches MotionCam Tools,
+    // which applies plane 0 to the (0, 1) R pixels of gbrg frames.
+    pixels = {100, 100, 100, 100};
+    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, channels, "gbrg");
+    assert((pixels == std::vector<uint16_t>{300, 400, 100, 200}));
 
     // Bilinear ramp: 4x1 frame over a 2x1 grid with channel gains 1 and 3.
     // Outer columns clamp to the edge samples; x = 1, 2 interpolate.
     mediacinemaraw::LensShadingMap ramp{2, 1, {1.0f, 1.0f, 1.0f, 1.0f, 3.0f, 3.0f, 3.0f, 3.0f}};
     pixels = {100, 100, 100, 100};
-    mediacinemaraw::applyLensShadingMap(pixels, 4, 1, ramp);
+    mediacinemaraw::applyLensShadingMap(pixels, 4, 1, ramp, "rggb");
     assert((pixels == std::vector<uint16_t>{100, 150, 250, 300}));
     assert(mediacinemaraw::lensShadingGainAt(ramp, 0, 0, 4, 1, 1) == 1.0f);
     assert(mediacinemaraw::lensShadingGainAt(ramp, 3, 0, 4, 1, 1) == 3.0f);
@@ -515,14 +570,14 @@ void TestLensShadingApply() {
     // would be undefined.
     mediacinemaraw::LensShadingMap huge{1, 1, {1e30f, 1e30f, 1e30f, 1e30f}};
     pixels = {100, 0, 65535, 64};
-    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, huge, 64.0f);
+    mediacinemaraw::applyLensShadingMap(pixels, 2, 2, huge, "rggb", 64.0f);
     assert((pixels == std::vector<uint16_t>{65535, 0, 65535, 64}));
 
-    // Guards: pixel-count mismatch, invalid map, bad black level.
+    // Guards: pixel-count mismatch, invalid map, bad arrangement, bad black.
     bool threw = false;
     try {
         pixels = {1, 2, 3};
-        mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat);
+        mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat, "rggb");
     } catch (const std::invalid_argument&) {
         threw = true;
     }
@@ -531,7 +586,7 @@ void TestLensShadingApply() {
     try {
         pixels = {1, 2, 3, 4};
         mediacinemaraw::LensShadingMap shortGains{1, 1, {1.0f}};
-        mediacinemaraw::applyLensShadingMap(pixels, 2, 2, shortGains);
+        mediacinemaraw::applyLensShadingMap(pixels, 2, 2, shortGains, "rggb");
     } catch (const std::invalid_argument&) {
         threw = true;
     }
@@ -539,7 +594,15 @@ void TestLensShadingApply() {
     threw = false;
     try {
         pixels = {1, 2, 3, 4};
-        mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat, -1.0f);
+        mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat, "RGGB");
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
+    threw = false;
+    try {
+        pixels = {1, 2, 3, 4};
+        mediacinemaraw::applyLensShadingMap(pixels, 2, 2, flat, "rggb", -1.0f);
     } catch (const std::invalid_argument&) {
         threw = true;
     }

@@ -3,9 +3,11 @@
 ## Unreleased
 
 - Added header-only `LensShading.h`: `parseLensShadingMap()` reads the
-  container-level `lensShadingMap` gain grid and `applyLensShadingMap()`
-  corrects decoded frames in place, with validation and bilinear sampling
-  shared with the sibling encoder.
+  per-frame `lensShadingMapWidth` / `lensShadingMapHeight` / `lensShadingMap`
+  gain grid (four nested R/Gr/Gb/B planes, the MotionCam Pro shape) and
+  `applyLensShadingMap()` corrects decoded frames in place through the
+  sensor CFA arrangement, with validation and bilinear sampling shared
+  with the sibling encoder.
 - Restructured the codebase without changing the wire format: decoder
   internals moved to documented `src/detail/` modules (SIMD, delta
   unpacking, tile loop, container constants), public headers documented,
