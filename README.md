@@ -91,10 +91,16 @@ Frame and container metadata are returned as JSON strings. Parse `width`,
 `height`, and `compressionType` from the frame JSON; container audio rate and
 channels are available via `audioSampleRateHz()` / `numAudioChannels()`.
 
+When the container JSON carries a `lensShadingMap` gain grid, read it with
+`mediacinemaraw::parseLensShadingMap()` and correct decoded frames in place
+with `mediacinemaraw::applyLensShadingMap()`, passing the sensor black level
+so gains scale the light-proportional signal. See `LensShading.h` for the
+schema and the DNG GainMap mapping.
+
 ## Layout
 
 - `include/MediaCinemaRAW/` — public headers (`Decoder.h`, `ContainerReader.h`,
-  `MotionSample.h`)
+  `MotionSample.h`, header-only `LensShading.h`)
 - `src/` — `Decoder.cpp`, `ContainerReader.cpp`, plus private `detail/`
   internals (SIMD helpers, delta unpacking, tile loop, container constants)
 - `tests/` — self-contained validation suite plus the sibling-encoder interop driver
